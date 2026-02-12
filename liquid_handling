@@ -1,0 +1,188 @@
+import re
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# --------- Input / Output ---------
+INPUT_CSV = "algae_sheet1_demo.csv"
+STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_XLSX = f"worklist_SDSU_{STAMP}.xlsx"
+
+# --------- Unit helpers (molar only; extend if needed) ---------
+MOLAR = {"M": 1e6, "mM": 1e3, "µM": 1.0, "uM": 1.0, "nM": 1e-3, "pM": 1e-6}
+
+def round_to(x, inc):
+    x = float(x)
+    return x if inc <= 0 else float(round(x / inc) * inc)
+
+def parse_target(val, unit):
+    """Accepts numeric target_value or strings like '50 mM' / '50mM'."""
+    if pd.isna(val):
+        return np.nan, unit
+    if isinstance(val, (int, float)):
+        return float(val), unit
+
+    s = str(val).strip()
+    m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*([A-Za-zµu/]+)?\s*$", s)
+    if not m:
+        return np.nan, unit
+
+    num = float(m.group(1))
+    u = (m.group(2) or unit)
+    if u:
+        u = u.replace("uM", "µM")
+    return num, u
+
+def ratio_c2_over_c1(C2, U2, C1, U1):
+    """Returns C2/C1 with molar conversions; errors on incompatible units."""
+    U2, U1 = str(U2), str(U1)
+    if U2 in MOLAR and U1 in MOLAR:
+        return (float(C2) * MOLAR[U2]) / (float(C1) * MOLAR[U1])
+    if U2 != U1:
+        raise ValueError(f"Incompatible units: target '{U2}' vs stock '{U1}'")
+    return float(C2) / float(C1)
+
+# --------- Load CSV and split blocks ---------
+df = pd.read_csv(INPUT_CSV)
+if "record_type" not in df.columns:
+    raise RuntimeError("Missing column 'record_type' (component/design/meta).")
+
+df["record_type"] = df["record_type"].astype(str).str.lower().str.strip()
+comp = df[df.record_type == "component"].copy()
+des  = df[df.record_type == "design"].copy()
+meta = df[df.record_type == "meta"].copy()
+
+# --------- Minimal validations ---------
+need_comp = ["component","stock_conc","stock_units","liquid_class","tip_type","source_labware_id","source_well"]
+need_des  = ["plate_id","well","component","target_value","target_units"]
+
+for c in need_comp:
+    if c not in comp.columns:
+        raise RuntimeError(f"Missing in component: {c}")
+for c in need_des:
+    if c not in des.columns:
+        raise RuntimeError(f"Missing in design: {c}")
+
+# --------- Meta (defaults if missing) ---------
+params = {"final_volume_uL": 100.0, "round_uL": 0.5, "diluent_name": "BaseMedia"}
+for _, r in meta.iterrows():
+    k = str(r.get("key","")).strip()
+    v = r.get("value", None)
+    if k in {"final_volume_uL","round_uL"}:
+        try: v = float(v)
+        except: pass
+    if k:
+        params[k] = v
+
+VFINAL  = float(params["final_volume_uL"])
+ROUND_uL = float(params["round_uL"])
+DILUENT = str(params["diluent_name"])
+
+# --------- Build inventory from component block ---------
+comp["component"] = comp["component"].astype(str).str.strip()
+inv = comp.set_index("component")
+
+if DILUENT not in inv.index:
+    raise RuntimeError(
+        f"Diluent '{DILUENT}' not found in component block. "
+        "Add it as a component with source_labware_id/source_well/liquid_class/tip_type."
+    )
+
+# --------- Normalize design and parse targets ---------
+des["plate_id"] = des["plate_id"].astype(str).str.strip()
+des["well"] = des["well"].astype(str).str.strip()
+des["component"] = des["component"].astype(str).str.strip()
+
+parsed = des.apply(lambda r: parse_target(r["target_value"], r["target_units"]), axis=1)
+des["C2"] = [p[0] for p in parsed]
+des["U2"] = [p[1] for p in parsed]
+
+# --------- Compute per (plate, well) and build outputs ---------
+sheet1_rows = []
+summary_rows = []
+
+for (plate, well), g in des.groupby(["plate_id","well"], sort=True):
+    solute_sum = 0.0
+    vols = {}
+
+    for _, r in g.iterrows():
+        name = r["component"]
+        if name not in inv.index:
+            raise RuntimeError(f"Component '{name}' used in design but missing in component block.")
+
+        C2 = r["C2"]
+        if pd.isna(C2) or float(C2) <= 0:
+            vols[name] = 0.0
+            continue
+
+        U2 = r["U2"] or inv.loc[name, "stock_units"]
+        C1 = float(inv.loc[name, "stock_conc"])
+        U1 = str(inv.loc[name, "stock_units"])
+
+        v = ratio_c2_over_c1(C2, U2, C1, U1) * VFINAL
+        v = round_to(max(v, 0.0), ROUND_uL)
+
+        vols[name] = v
+        solute_sum += v
+
+    if solute_sum - VFINAL > 1e-9:
+        raise RuntimeError(
+            f"{plate} {well}: solute volumes ({solute_sum}) exceed Vfinal ({VFINAL}). "
+            "Adjust targets, Vfinal, rounding, or stock concentrations."
+        )
+
+    v_dil = round_to(max(VFINAL - solute_sum, 0.0), ROUND_uL)
+
+    # Sheet1 rows for solutes
+    for name, v in vols.items():
+        if v <= 0:
+            continue
+        s = inv.loc[name]
+        sheet1_rows.append({
+            "SourceLabware": s["source_labware_id"],
+            "SourceWell": s["source_well"],
+            "DestinationLabware": plate,
+            "DestinationWell": well,
+            "TransferVolume": float(v),
+            "LiquidClass": s["liquid_class"],
+            "TipType": s["tip_type"],
+            "Comment": name
+        })
+
+    # Sheet1 row for diluent
+    if v_dil > 0:
+        s = inv.loc[DILUENT]
+        sheet1_rows.append({
+            "SourceLabware": s["source_labware_id"],
+            "SourceWell": s["source_well"],
+            "DestinationLabware": plate,
+            "DestinationWell": well,
+            "TransferVolume": float(v_dil),
+            "LiquidClass": s["liquid_class"],
+            "TipType": s["tip_type"],
+            "Comment": DILUENT
+        })
+
+    # Summary row
+    row = {"plate_id": plate, "well": well}
+    for name, v in vols.items():
+        row[f"vol_{name}_uL"] = float(v)
+    row[f"vol_{DILUENT}_uL"] = float(v_dil)
+    row["vol_total_uL"] = float(solute_sum + v_dil)
+    summary_rows.append(row)
+
+df_sheet1 = pd.DataFrame(sheet1_rows, columns=[
+    "SourceLabware","SourceWell","DestinationLabware","DestinationWell",
+    "TransferVolume","LiquidClass","TipType","Comment"
+])
+
+df_summary = pd.DataFrame(summary_rows)
+
+# --------- Write Excel ---------
+with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as w:
+    df_sheet1.to_excel(w, sheet_name="Sheet1", index=False)
+    df_summary.to_excel(w, sheet_name="Summary", index=False)
+
+print(f"Done: {OUTPUT_XLSX}")
+print(df_sheet1.head(10).to_string(index=False))
+print(df_summary.head(10).to_string(index=False))
